@@ -166,12 +166,6 @@ class BaseOptiplySink(OptiplySink):
                 self.logger.warning(f"Could not parse emails JSON string: {record['emails']}")
                 attributes["emails"] = []
 
-        # Convert boolean strings to actual booleans
-        boolean_fields = ["reactingToLostSales", "backorders", "ignored"]
-        for field in boolean_fields:
-            if field in record and isinstance(record[field], str):
-                attributes[field] = record[field].lower() == "true"
-
         # Fields that should be integers
         integer_fields = [
             "deliveryTime",
@@ -423,19 +417,6 @@ class ProductsSink(BaseOptiplySink):
             record: The record to transform
             attributes: The attributes dictionary to update
         """
-        # Handle resumingPurchase field - convert boolean to string array
-        if "resumingPurchase" in record and record["resumingPurchase"] is not None:
-            if record["resumingPurchase"]:
-                attributes["resumingPurchase"] = ["true"]
-            else:
-                attributes["resumingPurchase"] = ["false"]
-        
-        # Handle notBeingBought field - convert boolean to string array
-        if "notBeingBought" in record and record["notBeingBought"] is not None:
-            if record["notBeingBought"]:
-                attributes["notBeingBought"] = ["true"]
-            else:
-                attributes["notBeingBought"] = ["false"]
 
 class SupplierSink(BaseOptiplySink):
     """Optiply target sink class for suppliers."""
@@ -485,12 +466,6 @@ class SupplierSink(BaseOptiplySink):
             except json.JSONDecodeError:
                 self.logger.warning(f"Could not parse emails JSON string: {record['emails']}")
                 attributes["emails"] = []
-
-        # Convert boolean strings to actual booleans
-        boolean_fields = ["reactingToLostSales", "backorders", "ignored"]
-        for field in boolean_fields:
-            if field in record and isinstance(record[field], str):
-                attributes[field] = record[field].lower() == "true"
 
         # Fields that should be integers
         integer_fields = [
