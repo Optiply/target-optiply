@@ -574,8 +574,16 @@ class SellOrderSink(BaseOptiplySink):
         return "SellOrders"
     field_mappings = {
         "placed": "placed",
-        "totalValue": "totalValue"
+        "completed": "completed",
+        "totalValue": "totalValue",
+        "remoteId": "remoteId"
     }
+
+    def preprocess_record(self, record: dict, context: dict) -> dict:
+        payload = super().preprocess_record(record, context)
+        if "remoteId" in record:
+            payload["externalId"] = record["remoteId"]
+        return payload
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
@@ -594,6 +602,10 @@ class SellOrderSink(BaseOptiplySink):
             record: The record to transform
             attributes: The attributes dictionary to update
         """
+        completed = attributes.get("completed")
+        if isinstance(completed, str) and not completed.strip():
+            attributes.pop("completed", None)
+
         if "line_items" in record:
             line_items = json.loads(record["line_items"])
             sell_order_lines = []
@@ -601,15 +613,17 @@ class SellOrderSink(BaseOptiplySink):
             for item in line_items:
                 subtotal_value = float(item["subtotalValue"])
                 total_value += subtotal_value
-                sell_order_lines.append({
-                    "type": "sellOrderLines",
-                    "attributes": {
-                        "quantity": item["quantity"],
-                        "subtotalValue": str(subtotal_value),
-                        "productId": item["productId"]
-                    }
-                })
-            attributes["totalValue"] = str(total_value)
+                line_attributes = {
+                    "quantity": item["quantity"],
+                    "subtotalValue": str(subtotal_value),
+                    "productId": item["productId"]
+                }
+                placed = item.get("placed")
+                if placed is not None and (not isinstance(placed, str) or placed.strip()):
+                    line_attributes["placed"] = placed
+                sell_order_lines.append(line_attributes)
+            if "totalValue" not in attributes:
+                attributes["totalValue"] = str(total_value)
             attributes["orderLines"] = sell_order_lines
 
 
@@ -625,8 +639,15 @@ class SellOrderLineSink(BaseOptiplySink):
         "quantity": "quantity",
         "subtotalValue": "subtotalValue",
         "productId": "productId",
-        "sellOrderId": "sellOrderId"
+        "sellOrderId": "sellOrderId",
+        "placed": "placed"
     }
+
+    def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
+        """Omit blank optional placement dates from standalone lines."""
+        placed = attributes.get("placed")
+        if isinstance(placed, str) and not placed.strip():
+            attributes.pop("placed", None)
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
