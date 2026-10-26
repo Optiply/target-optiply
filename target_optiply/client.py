@@ -185,7 +185,7 @@ class OptiplySink(HotglueSink):
             logger.info("Received 401 error, attempting to refresh token and retry")
             try:
                 # Handle 401 response by refreshing token
-                self.authenticator.handle_401_response()
+                self.authenticator.handle_401_response(headers.get("Authorization"))
                 
                 # Get fresh headers with new token
                 headers = self.http_headers()
@@ -282,7 +282,7 @@ class OptiplySink(HotglueSink):
             logger.info("Received 401 error in request_api, attempting to refresh token and retry")
             try:
                 # Handle 401 response by refreshing token
-                self.authenticator.handle_401_response()
+                self.authenticator.handle_401_response(response.request.headers.get("Authorization"))
                 
                 # Retry the request with new token
                 response = _make_request()

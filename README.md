@@ -48,6 +48,7 @@ The following configuration options are required:
 |----------|-------------|---------|
 | `optiply_base_url` | Base URL for Optiply API | `https://api.optiply.com/v1` |
 | `optiply_dashboard_url` | Dashboard URL for authentication | `https://dashboard.optiply.nl/api` |
+| `OPTIPLY_WRITE_WORKERS` | Parallel write workers per stream (1-5; empty or invalid values fall back to 1). Streams still run one after another, and a record sharing a hash or Optiply ID with an in-flight write waits for it. | `1` (sequential) |
 
 ### Configuration Example
 
@@ -101,12 +102,13 @@ The target supports the following Optiply entity types:
 ### Sell Orders
 - **Endpoint**: `/sellOrders`
 - **Mandatory Fields**: `totalValue`, `placed`
-- **Supported Fields**: `placed`, `totalValue`
+- **Supported Fields**: `placed`, `completed`, `totalValue`
+- **Sales-history ETL contract**: CSV `order_id` and `order_placed` are required. Keep `order_id` as the source/grouping key only; it is not the Optiply JSON:API `data.id`, so omit `id` and send a POST. Map `order_placed` to `placed` and map nonblank `order_completed` to `completed`; omit blank optional dates. Emit a non-empty `line_items` JSON string, resolve `product_ean` or `product_sku` to `productId`, require `line_quantity`, map blank `line_subtotalvalue` to `subtotalValue` `0`, and map nonblank `line_placed` to nested `placed`. The ETL calculates `totalValue` and skips orders with no lines.
 
 ### Sell Order Lines
 - **Endpoint**: `/sellOrderLines`
 - **Mandatory Fields**: `subtotalValue`, `sellOrderId`, `productId`, `quantity`
-- **Supported Fields**: `quantity`, `subtotalValue`, `productId`, `sellOrderId`
+- **Supported Fields**: `quantity`, `subtotalValue`, `productId`, `sellOrderId`, `placed`
 
 ### Promotions
 - **Endpoint**: `/promotions`

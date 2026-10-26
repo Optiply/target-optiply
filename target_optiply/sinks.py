@@ -5,6 +5,7 @@ from __future__ import annotations
 import backoff
 import json
 import logging
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -21,6 +22,9 @@ from target_optiply.client import OptiplySink
 logger = logging.getLogger(__name__)
 
 _promotions_id_cache: Dict[str, str] = {}
+
+# Sinks share the target state dict, so record outcomes are written under one lock.
+_state_lock = threading.Lock()
 
 class DateTimeEncoder(json.JSONEncoder):
     """JSON encoder for datetime objects."""
@@ -42,14 +46,48 @@ class BaseOptiplySink(OptiplySink):
         super().__init__(target, stream_name, schema, key_properties)
         self.endpoint = self.stream_name.lower() if not self.endpoint else self.endpoint
         self._processed_records = []
-        self._stashed_external_id = None
+        # Per-thread record context: with write workers several records of this sink are in flight.
+        self._record_context = threading.local()
 
     def process_record(self, record: dict, context: dict) -> None:
-        self._stashed_external_id = record.get("externalId") or record.get("inputId")
-        super().process_record(record, context)
+        if not self.latest_state:
+            self.init_state()
+        external_id = record.get("externalId") or record.get("inputId")
+        if record.get("skip") is True:
+            # ETL-marked skip: no API call, counted as "existing" in the export summary.
+            state = {"success": True, "existing": True}
+            if external_id:
+                state["externalId"] = external_id
+            if record.get("skipReason"):
+                state["skipReason"] = record["skipReason"]
+            self.logger.info(f"{self.name} record skipped by ETL: {state}")
+            with _state_lock:
+                self.latest_state["summary"][self.name]["existing"] += 1
+                self.latest_state["bookmarks"][self.name].append(state)
+            return
+        keys = {self.build_record_hash(record)}
+        record_id = (record.get("data") or {}).get("id")
+        if record_id is not None:
+            keys.add(("id", str(record_id)))
+        process = super().process_record
+
+        def write() -> None:
+            self._record_context.external_id = external_id
+            process(record, context)
+
+        self._target.submit_write(self, keys, write)
+
+    def update_state(self, *args, **kwargs):
+        # Forward unchanged: target-hotglue 0.0.16 (the pinned runtime) has no `record` argument.
+        with _state_lock:
+            super().update_state(*args, **kwargs)
 
     def preprocess_record(self, record: dict, context: dict) -> dict:
         """Preprocess the record before sending to API."""
+        self._target.claim_writes(self)
+        if record.get("skip") is True:
+            return {"skip": True, "skipReason": record.get("skipReason")}
+
         # Build attributes using field mappings
         attributes = self.build_attributes(record, self.get_field_mappings())
 
@@ -574,8 +612,16 @@ class SellOrderSink(BaseOptiplySink):
         return "SellOrders"
     field_mappings = {
         "placed": "placed",
-        "totalValue": "totalValue"
+        "completed": "completed",
+        "totalValue": "totalValue",
+        "remoteId": "remoteId"
     }
+
+    def preprocess_record(self, record: dict, context: dict) -> dict:
+        payload = super().preprocess_record(record, context)
+        if "remoteId" in record:
+            payload["externalId"] = record["remoteId"]
+        return payload
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
@@ -594,6 +640,10 @@ class SellOrderSink(BaseOptiplySink):
             record: The record to transform
             attributes: The attributes dictionary to update
         """
+        completed = attributes.get("completed")
+        if isinstance(completed, str) and not completed.strip():
+            attributes.pop("completed", None)
+
         if "line_items" in record:
             line_items = json.loads(record["line_items"])
             sell_order_lines = []
@@ -601,15 +651,17 @@ class SellOrderSink(BaseOptiplySink):
             for item in line_items:
                 subtotal_value = float(item["subtotalValue"])
                 total_value += subtotal_value
-                sell_order_lines.append({
-                    "type": "sellOrderLines",
-                    "attributes": {
-                        "quantity": item["quantity"],
-                        "subtotalValue": str(subtotal_value),
-                        "productId": item["productId"]
-                    }
-                })
-            attributes["totalValue"] = str(total_value)
+                line_attributes = {
+                    "quantity": item["quantity"],
+                    "subtotalValue": str(subtotal_value),
+                    "productId": item["productId"]
+                }
+                placed = item.get("placed")
+                if placed is not None and (not isinstance(placed, str) or placed.strip()):
+                    line_attributes["placed"] = placed
+                sell_order_lines.append(line_attributes)
+            if "totalValue" not in attributes:
+                attributes["totalValue"] = str(total_value)
             attributes["orderLines"] = sell_order_lines
 
 
@@ -625,8 +677,15 @@ class SellOrderLineSink(BaseOptiplySink):
         "quantity": "quantity",
         "subtotalValue": "subtotalValue",
         "productId": "productId",
-        "sellOrderId": "sellOrderId"
+        "sellOrderId": "sellOrderId",
+        "placed": "placed"
     }
+
+    def _add_additional_attributes(self, record: Dict, attributes: Dict) -> None:
+        """Omit blank optional placement dates from standalone lines."""
+        placed = attributes.get("placed")
+        if isinstance(placed, str) and not placed.strip():
+            attributes.pop("placed", None)
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.
@@ -733,8 +792,9 @@ class PromotionSink(PromotionValueNormalizer, BaseOptiplySink):
 
     def upsert_record(self, record: dict, context: dict) -> tuple:
         record_id, success, state_updates = super().upsert_record(record, context)
-        if success and record_id and self._stashed_external_id:
-            _promotions_id_cache[str(self._stashed_external_id)] = str(record_id)
+        external_id = getattr(self._record_context, "external_id", None)
+        if success and record_id and external_id:
+            _promotions_id_cache[str(external_id)] = str(record_id)
         return record_id, success, state_updates
 
 

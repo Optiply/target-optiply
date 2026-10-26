@@ -5,12 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import requests
 import backoff
 from datetime import datetime
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# Every sink's authenticator shares the target config, and each grant replaces the previous
+# token, so parallel write workers must refresh one at a time.
+_token_lock = threading.RLock()
+
 
 class OptiplyAuthenticator:
     """API Authenticator for OAuth 2.0 password flow."""
@@ -32,7 +38,9 @@ class OptiplyAuthenticator:
     def auth_headers(self) -> dict:
         """Get authentication headers."""
         if not self.is_token_valid():
-            self.update_access_token()
+            with _token_lock:
+                if not self.is_token_valid():
+                    self.update_access_token()
         result = {}
         result["Authorization"] = f"Bearer {self._config.get('access_token')}"
         return result
@@ -108,8 +116,18 @@ class OptiplyAuthenticator:
         with open(self._target.config_file, "w") as outfile:
             json.dump(self._config, outfile, indent=4)
 
-    def handle_401_response(self) -> None:
-        """Handle 401 Unauthorized response by refreshing the token."""
-        logger.info("Received 401 Unauthorized response, refreshing token...")
-        self.update_access_token()
-        logger.info("Token refreshed after 401 response")
+    def handle_401_response(self, rejected_authorization: Optional[str] = None) -> None:
+        """Handle 401 Unauthorized response by refreshing the token.
+
+        Args:
+            rejected_authorization: Authorization header the API rejected. When another worker
+                already replaced that token, it is reused instead of requesting a new grant.
+        """
+        with _token_lock:
+            current_authorization = f"Bearer {self._config.get('access_token')}"
+            if rejected_authorization and rejected_authorization != current_authorization:
+                logger.info("Token already refreshed by another request")
+                return
+            logger.info("Received 401 Unauthorized response, refreshing token...")
+            self.update_access_token()
+            logger.info("Token refreshed after 401 response")

@@ -1,4 +1,7 @@
 """Optiply target class."""
+import os
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+
 from target_optiply.sinks import (
     BaseOptiplySink,
     ProductsSink,
@@ -13,8 +16,26 @@ from target_optiply.sinks import (
 )
 
 from target_hotglue.target import TargetHotglue
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Type, Union
 from pathlib import Path, PurePath
+
+DEFAULT_WRITE_WORKERS = 1
+MAX_WRITE_WORKERS = 5
+
+
+def get_write_workers_from_env() -> int:
+    """Number of parallel Optiply write workers, from env var OPTIPLY_WRITE_WORKERS (1-5)."""
+    raw = os.environ.get("OPTIPLY_WRITE_WORKERS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_WRITE_WORKERS
+    try:
+        workers = int(raw)
+    except ValueError:
+        print(f"WARNING -- invalid OPTIPLY_WRITE_WORKERS={raw!r}, using {DEFAULT_WRITE_WORKERS}")
+        return DEFAULT_WRITE_WORKERS
+    return max(1, min(workers, MAX_WRITE_WORKERS))
+
+
 
 
 class TargetOptiply(TargetHotglue):
@@ -58,6 +79,71 @@ class TargetOptiply(TargetHotglue):
         else:
             self.logger.info("No token key found in config (using access_token instead)")
 
+        # Records of one stream are written by up to OPTIPLY_WRITE_WORKERS threads; 1 keeps the
+        # sequential write path.
+        self._write_workers = get_write_workers_from_env()
+        self.logger.info(f"OPTIPLY_WRITE_WORKERS: {self._write_workers}")
+        self._write_pool = (
+            ThreadPoolExecutor(max_workers=self._write_workers) if self._write_workers > 1 else None
+        )
+        self._pending_writes: Dict[Future, Set] = {}
+        self._pending_sink = None
+
+    def claim_writes(self, sink) -> None:
+        """Finish another stream's in-flight writes before this sink starts preprocessing.
+
+        Later streams read results of earlier ones (e.g. promotion IDs), so streams never overlap.
+        """
+        if self._pending_sink is not sink:
+            self.flush_writes()
+            self._pending_sink = sink
+
+    def submit_write(self, sink, keys: Set, write: Callable[[], None]) -> None:
+        """Run one record write, in parallel when write workers are enabled.
+
+        A record sharing a key (hash or Optiply ID) with an in-flight write waits for all in-flight
+        writes first, so duplicates are still detected and updates to one ID keep their order.
+        """
+        if self._write_pool is None:
+            write()
+            return
+        self.claim_writes(sink)
+        if any(not keys.isdisjoint(pending) for pending in self._pending_writes.values()):
+            self.flush_writes()
+        while len(self._pending_writes) >= 2 * self._write_workers:
+            done, _ = wait(self._pending_writes, return_when=FIRST_COMPLETED)
+            self._collect_writes(done)
+        self._pending_writes[self._write_pool.submit(write)] = keys
+
+    def flush_writes(self) -> None:
+        """Wait for every in-flight write; re-raise the first worker error."""
+        if self._pending_writes:
+            wait(self._pending_writes)
+            self._collect_writes(list(self._pending_writes))
+
+    def _collect_writes(self, done) -> None:
+        error = None
+        for future in done:
+            self._pending_writes.pop(future, None)
+            if error is None:
+                error = future.exception()
+        if error is not None:
+            raise error
+
+    def drain_all(self, is_endofpipe: bool = False) -> None:
+        """Finish in-flight writes before the SDK snapshots and emits target state."""
+        self.flush_writes()
+        super().drain_all(is_endofpipe)
+        if is_endofpipe and self._write_pool is not None:
+            self._write_pool.shutdown()
+
+    def _save_failed_job_state(self):
+        """Let in-flight writes record their outcome before the failed-job state is saved."""
+        if self._pending_writes:
+            wait(self._pending_writes)
+            self._pending_writes.clear()
+        super()._save_failed_job_state()
+
     SINK_TYPES = [
         BaseOptiplySink,
         ProductsSink,
@@ -97,14 +183,19 @@ class TargetOptiply(TargetHotglue):
         simplified_dict = {}
         for stream_name, records in records_dict.items():
             if isinstance(records, list):
-                # Count successes and failures
-                success_count = sum(1 for record in records if record.get("success", False))
-                fail_count = len(records) - success_count
-                
+                # ETL-skipped records are stored with success and existing; count them only as existing.
+                existing_count = sum(1 for record in records if record.get("existing", False))
+                success_count = sum(
+                    1 for record in records
+                    if record.get("success", False) and not record.get("existing", False)
+                )
+                fail_count = len(records) - success_count - existing_count
+
                 simplified_dict[stream_name] = {
                     "total": len(records),
                     "success": success_count,
-                    "failed": fail_count
+                    "failed": fail_count,
+                    "existing": existing_count,
                 }
             else:
                 # Keep as is if not a list
