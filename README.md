@@ -179,10 +179,19 @@ The target automatically handles:
 - **Business rules**: Supplier types, GLN lengths, and other business validations
 
 ### Error Handling
-- **401 errors**: Automatic token refresh and retry with exponential backoff
-- **404 errors**: Record not found, logged as warning
-- **400+ errors**: Client errors, logged as errors
-- **500+ errors**: Server errors, retried with exponential backoff
+- **401 errors**: Automatic token refresh and one retry
+- **404 errors**: Record not found, logged as warning, counted as failed
+- **400+ / 500+ errors**: Counted as failed and logged once; only connection errors and timeouts are retried (3 tries, 30 s budget)
+
+### Logging
+Large jobs (hundreds of thousands of records) are log-bound, so the target emits:
+- one `<Stream> processed id: <id>` line per successful write (from the Hotglue SDK);
+- one line per failed write, with everything needed to diagnose it:
+  `[<worker>] <Stream> <POST|PATCH> externalId=<ext> id=<id> failed (<status>): <API error>; payload=<json>`
+  (`<worker>` is `MainThread` or `optiply-write_N` when `OPTIPLY_WRITE_WORKERS` > 1);
+- ETL-skipped records at DEBUG only (they are counted as `existing` in the state);
+- the final state as its byte size plus the per-stream `summary`; the full state goes to stdout only.
+No request bodies, response bodies, config keys, or credential fragments are logged.
 
 ## Output Files
 

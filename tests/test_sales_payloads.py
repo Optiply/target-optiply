@@ -2,6 +2,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Tuple
@@ -76,6 +77,7 @@ def _sink(sink_class: Any) -> Any:
     sink.endpoint = sink_class.endpoint
     sink.logger = logging.getLogger(sink_class.__name__)
     sink._target = Mock()
+    sink._record_context = threading.local()
     return sink
 
 
@@ -149,6 +151,29 @@ def test_nested_sell_order_payload_and_post_without_target_id():
         endpoint="sellOrders",
         request_data=payload,
     )
+
+
+def test_upsert_logs_nothing_on_success_and_one_line_with_context_on_failure(caplog):
+    sink = _sink(SellOrderSink)
+    sink._record_context.external_id = "o-42"
+    sink._get_error_message = lambda text, status, url: f"parsed({status})"
+    payload = sink.preprocess_record({"remoteId": "o-42", "placed": "2025-01-01", "totalValue": "1"}, {})
+
+    with caplog.at_level(logging.DEBUG, logger=sink.logger.name):
+        with patch.object(sink, "request_api", new=Mock(return_value=_Response()), create=True):
+            assert sink.upsert_record(payload, {}) == CREATED
+        assert caplog.records == []
+
+        rejected = _Response()
+        rejected.status_code, rejected.text, rejected.url = 422, '{"errors": []}', "u"
+        with patch.object(sink, "request_api", new=Mock(return_value=rejected), create=True):
+            assert sink.upsert_record(payload, {}) == (None, False, {})
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert caplog.records[0].levelno == logging.ERROR
+    for part in ("SellOrders POST", "externalId=o-42", "(422)", "parsed(422)", json.dumps(payload)):
+        assert part in message
 
 
 def test_sell_order_remote_id_is_sdk_external_id_and_stays_in_optiply_payload():

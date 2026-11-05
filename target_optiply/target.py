@@ -1,5 +1,8 @@
 """Optiply target class."""
+import json
+import logging
 import os
+import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from target_optiply.sinks import (
@@ -22,6 +25,8 @@ from pathlib import Path, PurePath
 DEFAULT_WRITE_WORKERS = 1
 MAX_WRITE_WORKERS = 5
 
+logger = logging.getLogger(__name__)
+
 
 def get_write_workers_from_env() -> int:
     """Number of parallel Optiply write workers, from env var OPTIPLY_WRITE_WORKERS (1-5)."""
@@ -31,7 +36,8 @@ def get_write_workers_from_env() -> int:
     try:
         workers = int(raw)
     except ValueError:
-        print(f"WARNING -- invalid OPTIPLY_WRITE_WORKERS={raw!r}, using {DEFAULT_WRITE_WORKERS}")
+        # Never print: a target's stdout is the Singer STATE channel.
+        logger.warning(f"invalid OPTIPLY_WRITE_WORKERS={raw!r}, using {DEFAULT_WRITE_WORKERS}")
         return DEFAULT_WRITE_WORKERS
     return max(1, min(workers, MAX_WRITE_WORKERS))
 
@@ -49,42 +55,17 @@ class TargetOptiply(TargetHotglue):
         state: str = None
     ) -> None:
         self.config_file = config[0]
-        self.logger.info(f"Target config file: {self.config_file}")
         super().__init__(config, parse_env_config, validate_config)
-        
-        # Log the config structure after initialization
-        self.logger.info(f"Target config keys: {list(self._config.keys())}")
-        
-        # Log the access_token being used
-        if "access_token" in self._config:
-            access_token = self._config["access_token"]
-            # Log first few characters of token for security
-            if access_token and len(access_token) > 8:
-                masked_token = access_token[:4] + "*" * (len(access_token) - 8) + access_token[-4:]
-                self.logger.info(f"Using access_token: {masked_token}")
-            else:
-                self.logger.info(f"Using access_token: {access_token}")
-        else:
-            self.logger.warning("No access_token found in config")
-        
-        # Also check for "token" key for backward compatibility
-        if "token" in self._config:
-            token = self._config["token"]
-            # Log first few characters of token for security
-            if token and len(token) > 8:
-                masked_token = token[:4] + "*" * (len(token) - 8) + token[-4:]
-                self.logger.info(f"Using token: {masked_token}")
-            else:
-                self.logger.info(f"Using token: {token}")
-        else:
-            self.logger.info("No token key found in config (using access_token instead)")
 
         # Records of one stream are written by up to OPTIPLY_WRITE_WORKERS threads; 1 keeps the
         # sequential write path.
         self._write_workers = get_write_workers_from_env()
-        self.logger.info(f"OPTIPLY_WRITE_WORKERS: {self._write_workers}")
+        self.logger.info(
+            f"Config file: {self.config_file}; OPTIPLY_WRITE_WORKERS={self._write_workers}"
+        )
         self._write_pool = (
-            ThreadPoolExecutor(max_workers=self._write_workers) if self._write_workers > 1 else None
+            ThreadPoolExecutor(max_workers=self._write_workers, thread_name_prefix="optiply-write")
+            if self._write_workers > 1 else None
         )
         self._pending_writes: Dict[Future, Set] = {}
         self._pending_sink = None
@@ -143,6 +124,18 @@ class TargetOptiply(TargetHotglue):
             wait(self._pending_writes)
             self._pending_writes.clear()
         super()._save_failed_job_state()
+
+    def _write_state_message(self, state: dict) -> None:
+        """Emit the state unchanged, but log only the per-stream counts.
+
+        The state holds one bookmark per record; the SDK logs the whole JSON, which dominates the
+        log of a large job.
+        """
+        state_json = json.dumps(state)
+        summary = (state.get("target") or state).get("summary") or {}
+        self.logger.info(f"Emitting target state ({len(state_json)} bytes); summary: {json.dumps(summary)}")
+        sys.stdout.write(f"{state_json}\n")
+        sys.stdout.flush()
 
     SINK_TYPES = [
         BaseOptiplySink,
