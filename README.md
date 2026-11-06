@@ -184,14 +184,19 @@ The target automatically handles:
 - **400+ / 500+ errors**: Counted as failed and logged once; only connection errors and timeouts are retried (3 tries, 30 s budget)
 
 ### Logging
-Large jobs (hundreds of thousands of records) are log-bound, so the target emits:
-- one `<Stream> processed id: <id>` line per successful write (from the Hotglue SDK);
-- one line per failed write, with everything needed to diagnose it:
-  `[<worker>] <Stream> <POST|PATCH> externalId=<ext> id=<id> failed (<status>): <API error>; payload=<json>`
-  (`<worker>` is `MainThread` or `optiply-write_N` when `OPTIPLY_WRITE_WORKERS` > 1);
-- ETL-skipped records at DEBUG only (they are counted as `existing` in the state);
+Large jobs (hundreds of thousands of records) are log-bound, so the target emits, like the ETL template:
+- one progress line per write: `<Stream> Record: <i> of Total: <n> | remoteId: <id>`. `<n>` is counted
+  per stream before writing when the input is a file (`--input` or `< file`); for piped input the
+  line is `<Stream> Record: <i> | remoteId: <id>`. The Hotglue SDK's `processed id` line is suppressed;
+- one extra line per failed write: `<progress line> | <POST|PATCH> failed (<status>): <API error>`;
+- ETL-skipped records at DEBUG only (they keep their number and are counted as `existing` in the state);
 - the final state as its byte size plus the per-stream `summary`; the full state goes to stdout only.
 No request bodies, response bodies, config keys, or credential fragments are logged.
+
+Request details go to `etl-output/target_requests.csv` instead (one row per write request: `time`,
+`stream`, `record`, `total`, `remoteId`, `method`, `endpoint`, `status`, `optiplyId`, `error`,
+`payload`). The folder is `$ROOT_DIR/etl-output` (the ETL's root), else `/home/hotglue/$JOB_ID/etl-output`,
+else `./etl-output`.
 
 ## Output Files
 

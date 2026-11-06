@@ -48,11 +48,15 @@ class BaseOptiplySink(OptiplySink):
         self._processed_records = []
         # Per-thread record context: with write workers several records of this sink are in flight.
         self._record_context = threading.local()
+        self._record_number = 0
 
     def process_record(self, record: dict, context: dict) -> None:
         if not self.latest_state:
             self.init_state()
         external_id = record.get("externalId") or record.get("inputId")
+        # Numbered here, in input order, so the progress line matches the template's "Record: i of Total".
+        self._record_number += 1
+        number = self._record_number
         if record.get("skip") is True:
             # ETL-marked skip: no API call, counted as "existing" in the export summary.
             state = {"success": True, "existing": True}
@@ -73,6 +77,7 @@ class BaseOptiplySink(OptiplySink):
 
         def write() -> None:
             self._record_context.external_id = external_id
+            self._record_context.number = number
             process(record, context)
 
         self._target.submit_write(self, keys, write)
@@ -110,30 +115,38 @@ class BaseOptiplySink(OptiplySink):
     def upsert_record(self, record: dict, context: dict) -> tuple:
         """Process the record and return (id, success, state_updates).
 
-        Logging: nothing on success (the SDK logs `<stream> processed id`), exactly one line per
-        failure carrying the record identity, the API error details and the payload.
+        Logging: one progress line per write, `<stream> Record: i of Total: n | remoteId: <id>`, plus one
+        error line per failure. Request details (payload, status, error) go to the request CSV.
         """
         state_updates = {}
         record_id = (record.get("data") or {}).get("id") or record.get("id")
         http_method = "PATCH" if record_id else "POST"
-        external_id = getattr(self._record_context, "external_id", None)
-        # Worker threads are named optiply-write_N; the sequential path runs on MainThread.
-        worker = threading.current_thread().name
-        label = f"[{worker}] {self.name} {http_method} externalId={external_id} id={record_id}"
+        attributes = (record.get("data") or {}).get("attributes", record)
+        remote_id = getattr(self._record_context, "external_id", None) or attributes.get("remoteId")
+        number = getattr(self._record_context, "number", None)
+        total = self._target.record_totals.get(self.stream_name)
+        progress = f"{self.name} Record: {number}" + (f" of Total: {total}" if total else "")
+        label = f"{progress} | remoteId: {remote_id}"
+        endpoint = f"{self.endpoint}/{record_id}" if record_id else self.endpoint
+        request_row = {
+            "stream": self.name, "record": number, "total": total, "remoteId": remote_id,
+            "method": http_method, "endpoint": endpoint, "payload": json.dumps(record, default=str),
+        }
+        self.logger.info(label)
 
         try:
             if http_method == "POST":
-                attributes = (record.get("data") or {}).get("attributes", record)
                 missing_fields = [
                     field for field in self.get_mandatory_fields()
                     if attributes.get(field) is None
                     or (isinstance(attributes[field], str) and not attributes[field].strip())
                 ]
                 if missing_fields:
-                    self.logger.error(f"{label} skipped: missing mandatory fields {', '.join(missing_fields)}")
+                    error = f"missing mandatory fields {', '.join(missing_fields)}"
+                    self.logger.error(f"{label} | skipped: {error}")
+                    self._target.log_request(dict(request_row, error=error))
                     return None, False, state_updates
 
-            endpoint = f"{self.endpoint}/{record_id}" if record_id else self.endpoint
             response = self.request_api(
                 http_method=http_method,
                 endpoint=endpoint,
@@ -143,15 +156,20 @@ class BaseOptiplySink(OptiplySink):
             if response.status_code >= 400:
                 details = self._get_error_message(response.text, response.status_code, response.url)
                 log = self.logger.warning if response.status_code == 404 else self.logger.error
-                log(f"{label} failed ({response.status_code}): {details}; payload={json.dumps(record, default=str)}")
+                log(f"{label} | {http_method} failed ({response.status_code}): {details}")
+                self._target.log_request(dict(request_row, status=response.status_code, error=details))
                 return None, False, state_updates
 
             response_data = response.json()
             response_record_id = (response_data.get("data") or {}).get("id") or record_id or "unknown"
+            self._target.log_request(
+                dict(request_row, status=response.status_code, optiplyId=response_record_id)
+            )
             return response_record_id, True, state_updates
 
         except Exception as e:
-            self.logger.error(f"{label} failed: {e!r}")
+            self.logger.error(f"{label} | {http_method} failed: {e!r}")
+            self._target.log_request(dict(request_row, error=repr(e)))
             return None, False, state_updates
 
     def get_field_mappings(self) -> Dict[str, str]:
