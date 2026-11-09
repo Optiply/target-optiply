@@ -48,11 +48,15 @@ class BaseOptiplySink(OptiplySink):
         self._processed_records = []
         # Per-thread record context: with write workers several records of this sink are in flight.
         self._record_context = threading.local()
+        self._record_number = 0
 
     def process_record(self, record: dict, context: dict) -> None:
         if not self.latest_state:
             self.init_state()
         external_id = record.get("externalId") or record.get("inputId")
+        # Numbered here, in input order, so the progress line matches the template's "Record: i of Total".
+        self._record_number += 1
+        number = self._record_number
         if record.get("skip") is True:
             # ETL-marked skip: no API call, counted as "existing" in the export summary.
             state = {"success": True, "existing": True}
@@ -60,7 +64,7 @@ class BaseOptiplySink(OptiplySink):
                 state["externalId"] = external_id
             if record.get("skipReason"):
                 state["skipReason"] = record["skipReason"]
-            self.logger.info(f"{self.name} record skipped by ETL: {state}")
+            self.logger.debug(f"{self.name} record skipped by ETL: {state}")
             with _state_lock:
                 self.latest_state["summary"][self.name]["existing"] += 1
                 self.latest_state["bookmarks"][self.name].append(state)
@@ -73,6 +77,7 @@ class BaseOptiplySink(OptiplySink):
 
         def write() -> None:
             self._record_context.external_id = external_id
+            self._record_context.number = number
             process(record, context)
 
         self._target.submit_write(self, keys, write)
@@ -108,86 +113,63 @@ class BaseOptiplySink(OptiplySink):
         return payload
 
     def upsert_record(self, record: dict, context: dict) -> tuple:
-        """Process the record and return (id, success, state_updates)."""
-        state_updates = {}
-        
-        try:
-            # Get the ID from the preprocessed record structure
-            record_id = None
-            if 'data' in record and 'id' in record['data']:
-                record_id = record['data']['id']
-            elif 'id' in record:
-                record_id = record['id']
-            
-            # Set http_method based on presence of id field
-            http_method = "PATCH" if record_id else "POST"
-            
-            # Log record processing
-            self.logger.info(f"Processing record for {self.stream_name} (ID: {record_id})")
+        """Process the record and return (id, success, state_updates).
 
-            # For POST requests, check mandatory fields
+        Logging: one progress line per write, `<stream> Record: i of Total: n | remoteId: <id>`, plus one
+        error line per failure. Request details (payload, status, error) go to the request CSV.
+        """
+        state_updates = {}
+        record_id = (record.get("data") or {}).get("id") or record.get("id")
+        http_method = "PATCH" if record_id else "POST"
+        attributes = (record.get("data") or {}).get("attributes", record)
+        remote_id = getattr(self._record_context, "external_id", None) or attributes.get("remoteId")
+        number = getattr(self._record_context, "number", None)
+        total = self._target.record_totals.get(self.stream_name)
+        progress = f"{self.name} Record: {number}" + (f" of Total: {total}" if total else "")
+        label = f"{progress} | remoteId: {remote_id}"
+        endpoint = f"{self.endpoint}/{record_id}" if record_id else self.endpoint
+        request_row = {
+            "stream": self.name, "record": number, "total": total, "remoteId": remote_id,
+            "method": http_method, "endpoint": endpoint, "payload": json.dumps(record, default=str),
+        }
+        self.logger.info(label)
+
+        try:
             if http_method == "POST":
-                mandatory_fields = self.get_mandatory_fields()
-                missing_fields = []
-                
-                # Get the actual record data - it might be nested in data.attributes
-                actual_record = record
-                if 'data' in record and 'attributes' in record['data']:
-                    actual_record = record['data']['attributes']
-                
-                for field in mandatory_fields:
-                    if field not in actual_record or actual_record[field] is None or (isinstance(actual_record[field], str) and not actual_record[field].strip()):
-                        missing_fields.append(field)
+                missing_fields = [
+                    field for field in self.get_mandatory_fields()
+                    if attributes.get(field) is None
+                    or (isinstance(attributes[field], str) and not attributes[field].strip())
+                ]
                 if missing_fields:
-                    error_msg = f"Record skipped due to missing mandatory fields: {', '.join(missing_fields)}"
-                    self.logger.error(error_msg)
+                    error = f"missing mandatory fields {', '.join(missing_fields)}"
+                    self.logger.error(f"{label} | skipped: {error}")
+                    self._target.log_request(dict(request_row, error=error))
                     return None, False, state_updates
 
-            # Get the URL for the request
-            if record_id:
-                endpoint = f"{self.endpoint}/{record_id}"
-            else:
-                endpoint = self.endpoint
-                
-            self.logger.info(f"Making {http_method} request to: {endpoint}")
-
-            # Make the request
             response = self.request_api(
                 http_method=http_method,
                 endpoint=endpoint,
                 request_data=record
             )
-            
-            self.logger.info(f"Response status: {response.status_code}")
-            self.logger.info(f"Response body: {response.text}")
 
-            # Handle response
-            if response.status_code == 404:
-                # Get meaningful error message from response
-                error_details = self._get_error_message_from_response(response.text, response.status_code)
-                error_msg = f"Record not found (404): {record_id} - {error_details}"
-                self.logger.warning(error_msg)
-                return None, False, state_updates
-            elif response.status_code >= 400:
-                # Get meaningful error message from response
-                error_details = self._get_error_message_from_response(response.text, response.status_code)
-                error_msg = f"Request failed with status {response.status_code}: {error_details}"
-                self.logger.error(error_msg)
+            if response.status_code >= 400:
+                details = self._get_error_message(response.text, response.status_code, response.url)
+                log = self.logger.warning if response.status_code == 404 else self.logger.error
+                log(f"{label} | {http_method} failed ({response.status_code}): {details}")
+                self._target.log_request(dict(request_row, status=response.status_code, error=details))
                 return None, False, state_updates
 
-            # Parse response to get ID
             response_data = response.json()
-            if "data" in response_data and "id" in response_data["data"]:
-                response_record_id = response_data["data"]["id"]
-            else:
-                response_record_id = record_id or "unknown"
-
-            self.logger.info(f"{self.stream_name} processed with id: {response_record_id}")
+            response_record_id = (response_data.get("data") or {}).get("id") or record_id or "unknown"
+            self._target.log_request(
+                dict(request_row, status=response.status_code, optiplyId=response_record_id)
+            )
             return response_record_id, True, state_updates
 
         except Exception as e:
-            error_msg = f"Error processing record: {str(e)}"
-            self.logger.error(error_msg)
+            self.logger.error(f"{label} | {http_method} failed: {e!r}")
+            self._target.log_request(dict(request_row, error=repr(e)))
             return None, False, state_updates
 
     def get_field_mappings(self) -> Dict[str, str]:
@@ -197,41 +179,6 @@ class BaseOptiplySink(OptiplySink):
             The field mappings dictionary.
         """
         return self.field_mappings
-
-    def _get_error_message_from_response(self, response_text: str, status_code: int) -> str:
-        """Get a meaningful error message from response text."""
-        if not response_text or response_text.strip() in ['', 'null', 'None']:
-            return f"No error details provided (status {status_code})"
-        
-        # Try to parse JSON error response
-        try:
-            import json
-            error_data = json.loads(response_text)
-            if isinstance(error_data, dict):
-                if 'errors' in error_data and isinstance(error_data['errors'], list):
-                    error_messages = []
-                    for error in error_data['errors']:
-                        if isinstance(error, dict):
-                            if 'meta' in error and 'message' in error['meta']:
-                                error_messages.append(error['meta']['message'])
-                            elif 'detail' in error:
-                                error_messages.append(error['detail'])
-                            elif 'message' in error:
-                                error_messages.append(error['message'])
-                    if error_messages:
-                        return f"API Error: {'; '.join(error_messages)}"
-                elif 'message' in error_data:
-                    return f"API Error: {error_data['message']}"
-                elif 'error' in error_data:
-                    return f"API Error: {error_data['error']}"
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-        
-        # Fallback to raw response text if it's meaningful
-        if len(response_text.strip()) > 0:
-            return f"API Error: {response_text}"
-        else:
-            return f"No error details provided (status {status_code})"
 
     def build_attributes(self, record: Dict, field_mappings: Dict[str, str]) -> Dict:
         """Build attributes dictionary from record using field mappings.
@@ -506,12 +453,6 @@ class SupplierProductSink(BaseOptiplySink):
             else:
                 self.logger.warning(f"Invalid status value: {attributes['status']}. Must be 'enabled' or 'disabled'")
                 attributes["status"] = "enabled"  # Default to enabled
-        
-        # Remove any None values that might cause issues
-        attributes = {k: v for k, v in attributes.items() if v is not None}
-        
-        # Log the final attributes for debugging
-        self.logger.info(f"Final attributes for {self.stream_name}: {attributes}")
 
     def get_mandatory_fields(self) -> List[str]:
         """Get the list of mandatory fields for this sink.

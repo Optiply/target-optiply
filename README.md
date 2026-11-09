@@ -179,10 +179,24 @@ The target automatically handles:
 - **Business rules**: Supplier types, GLN lengths, and other business validations
 
 ### Error Handling
-- **401 errors**: Automatic token refresh and retry with exponential backoff
-- **404 errors**: Record not found, logged as warning
-- **400+ errors**: Client errors, logged as errors
-- **500+ errors**: Server errors, retried with exponential backoff
+- **401 errors**: Automatic token refresh and one retry
+- **404 errors**: Record not found, logged as warning, counted as failed
+- **400+ / 500+ errors**: Counted as failed and logged once; only connection errors and timeouts are retried (3 tries, 30 s budget)
+
+### Logging
+Large jobs (hundreds of thousands of records) are log-bound, so the target emits, like the ETL template:
+- one progress line per write: `<Stream> Record: <i> of Total: <n> | remoteId: <id>`. `<n>` is counted
+  per stream before writing when the input is a file (`--input` or `< file`); for piped input the
+  line is `<Stream> Record: <i> | remoteId: <id>`. The Hotglue SDK's `processed id` line is suppressed;
+- one extra line per failed write: `<progress line> | <POST|PATCH> failed (<status>): <API error>`;
+- ETL-skipped records at DEBUG only (they keep their number and are counted as `existing` in the state);
+- the final state as its byte size plus the per-stream `summary`; the full state goes to stdout only.
+No request bodies, response bodies, config keys, or credential fragments are logged.
+
+Request details go to `etl-output/target_requests.csv` instead (one row per write request: `time`,
+`stream`, `record`, `total`, `remoteId`, `method`, `endpoint`, `status`, `optiplyId`, `error`,
+`payload`). The folder is `$ROOT_DIR/etl-output` (the ETL's root), else `/home/hotglue/$JOB_ID/etl-output`,
+else `./etl-output`.
 
 ## Output Files
 

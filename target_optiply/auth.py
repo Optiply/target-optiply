@@ -75,7 +75,7 @@ class OptiplyAuthenticator:
     def update_access_token(self) -> None:
         """Update the access token by making a request to the auth endpoint."""
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        logger.info(f"OAuth request - endpoint: {self._auth_endpoint}, body: {self.oauth_request_body}")
+        logger.info(f"Requesting OAuth token from {self._auth_endpoint}")
         
         # Prepare Basic Auth headers
         import base64
@@ -99,14 +99,13 @@ class OptiplyAuthenticator:
 
         try:
             token_response.raise_for_status()
-            logger.info("OAuth authorization attempt was successful.")
+            logger.info("OAuth token refreshed")
         except Exception as ex:
             raise RuntimeError(
                 f"Failed OAuth login, response was '{token_response.json()}'. {ex}"
             )
         
         token_json = token_response.json()
-        logger.info(f"Latest refresh token: {token_json['refresh_token']}")
         
         self._config["access_token"] = token_json["access_token"]
         self._config["refresh_token"] = token_json["refresh_token"]

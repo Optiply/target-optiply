@@ -2,6 +2,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Tuple
@@ -76,6 +77,8 @@ def _sink(sink_class: Any) -> Any:
     sink.endpoint = sink_class.endpoint
     sink.logger = logging.getLogger(sink_class.__name__)
     sink._target = Mock()
+    sink._record_context = threading.local()
+    sink._record_number = 0
     return sink
 
 
@@ -149,6 +152,48 @@ def test_nested_sell_order_payload_and_post_without_target_id():
         endpoint="sellOrders",
         request_data=payload,
     )
+
+
+def test_upsert_logs_template_progress_line_and_records_each_request(caplog):
+    sink = _sink(SellOrderSink)
+    sink._target.record_totals = {sink.stream_name: 500}
+    sink._record_context.external_id = "o-42"
+    sink._record_context.number = 12
+    sink._get_error_message = lambda text, status, url: f"parsed({status})"
+    payload = sink.preprocess_record({"remoteId": "o-42", "placed": "2025-01-01", "totalValue": "1"}, {})
+    progress = "SellOrders Record: 12 of Total: 500 | remoteId: o-42"
+
+    with caplog.at_level(logging.DEBUG, logger=sink.logger.name):
+        with patch.object(sink, "request_api", new=Mock(return_value=_Response()), create=True):
+            assert sink.upsert_record(payload, {}) == CREATED
+        assert [r.getMessage() for r in caplog.records] == [progress]
+        caplog.clear()
+
+        rejected = _Response()
+        rejected.status_code, rejected.text, rejected.url = 422, '{"errors": []}', "u"
+        with patch.object(sink, "request_api", new=Mock(return_value=rejected), create=True):
+            assert sink.upsert_record(payload, {}) == (None, False, {})
+
+    assert [r.getMessage() for r in caplog.records] == [progress, f"{progress} | POST failed (422): parsed(422)"]
+    assert caplog.records[1].levelno == logging.ERROR
+    created, failed = (call.args[0] for call in sink._target.log_request.call_args_list)
+    common = {
+        "stream": "SellOrders", "record": 12, "total": 500, "remoteId": "o-42", "method": "POST",
+        "endpoint": "sellOrders", "payload": json.dumps(payload),
+    }
+    assert created == {**common, "status": 201, "optiplyId": "created-order"}
+    assert failed == {**common, "status": 422, "error": "parsed(422)"}
+
+
+def test_progress_line_omits_total_when_input_could_not_be_counted(caplog):
+    sink = _sink(SellOrderSink)
+    sink._target.record_totals = {}
+    sink._record_context.number = 3
+    payload = sink.preprocess_record({"remoteId": "o-7", "placed": "2025-01-01", "totalValue": "1"}, {})
+    with caplog.at_level(logging.INFO, logger=sink.logger.name):
+        with patch.object(sink, "request_api", new=Mock(return_value=_Response()), create=True):
+            sink.upsert_record(payload, {})
+    assert caplog.records[0].getMessage() == "SellOrders Record: 3 | remoteId: o-7"
 
 
 def test_sell_order_remote_id_is_sdk_external_id_and_stays_in_optiply_payload():
